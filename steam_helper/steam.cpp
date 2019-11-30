@@ -35,6 +35,7 @@
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #pragma push_macro("_WIN32")
 #pragma push_macro("__cdecl")
@@ -137,12 +138,125 @@ static WCHAR *find_quote(WCHAR *str)
     return NULL;
 }
 
+struct steam_ceg_handles {
+    HANDLE consume_handle;
+    HANDLE produce_handle[2];
+    HANDLE file_handle;
+    void  *file_mapping;
+};
+
+struct steam_app_ceg_info {
+    uint32_t pid;
+    uint32_t active_process;
+    char     startup_module[256];
+    char     start_event   [256];
+    char     term_event    [256];
+};
+
+static void setup_ceg_handles(steam_ceg_handles *handles) {
+    SECURITY_DESCRIPTOR security_descriptor;
+    SECURITY_ATTRIBUTES semaphore_attributes = {
+        .nLength              = sizeof(SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = &security_descriptor,
+        .bInheritHandle       = FALSE
+    };
+
+    InitializeSecurityDescriptor(&security_descriptor, 1);
+    SetSecurityDescriptorDacl(&security_descriptor, 1, 0, 0);
+
+    handles->consume_handle    = CreateSemaphoreA(&semaphore_attributes, 0, 512, "STEAM_DIPC_CONSUME");
+    handles->produce_handle[0] = CreateSemaphoreA(&semaphore_attributes, 1, 512, "STEAM_DIPC_PRODUCE");
+    /* Some titles listen for a typo'ed version.*/
+    handles->produce_handle[1] = CreateSemaphoreA(&semaphore_attributes, 1, 512, "SREAM_DIPC_PRODUCE");
+    handles->file_handle       = CreateFileMappingA(INVALID_HANDLE_VALUE, &semaphore_attributes, PAGE_READWRITE, 0, 4096, "STEAM_DRM_IPC");
+    handles->file_mapping      = MapViewOfFile(handles->file_handle, 0xF001Fu, 0, 0, 0);
+
+    WINE_TRACE("CEG: Created base CEG handles + mapping.\n");
+}
+
+static void cleanup_ceg_handles(steam_ceg_handles *handles) {
+    UnmapViewOfFile(handles->file_mapping);
+
+    CloseHandle(handles->file_handle);
+    CloseHandle(handles->produce_handle[0]);
+    CloseHandle(handles->produce_handle[1]);
+    CloseHandle(handles->consume_handle);
+
+    WINE_TRACE("CEG: Cleaned up CEG handles.\n");
+}
+
+static void steam_ceg_interface(steam_ceg_handles* ceg_handles) {
+    steam_app_ceg_info info;
+    HANDLE start_handle;
+
+    const char* ipc_data = (const char*)ceg_handles->file_mapping;
+
+    WINE_TRACE("CEG: Waiting for CEG interface...\n");
+
+    /* Wait 1.5s for the game to give us their CEG data.
+     * Otherwise give up. */
+    if (WaitForSingleObject(ceg_handles->consume_handle, 1500) != WAIT_OBJECT_0) {
+        WINE_TRACE("CEG: No CEG interface.\n");
+        return;
+    }
+
+    /* Read the stuff given to us by the IPC file */
+    WINE_TRACE("CEG: Parsing pid...\n");
+    info.pid = *((uint32_t*)(&ipc_data));
+    ipc_data += sizeof(uint32_t);
+    WINE_TRACE("CEG: pid: %u\n", info.pid);
+
+    WINE_TRACE("CEG: Parsing active_process...\n");
+    info.active_process = *((uint32_t*)(&ipc_data));
+    ipc_data += sizeof(uint32_t);
+    WINE_TRACE("CEG: active_process: %u\n", info.active_process);
+
+    WINE_TRACE("CEG: Parsing startup_module...\n");
+    strcpy(info.startup_module, ipc_data);
+    ipc_data += strlen(info.startup_module);
+    WINE_TRACE("CEG: startup_module: %s\n", info.startup_module);
+
+    WINE_TRACE("CEG: Parsing start_event...\n");
+    strcpy(info.start_event, ipc_data);
+    ipc_data += strlen(info.start_event);
+    WINE_TRACE("CEG: start_event: %s\n", info.start_event);
+
+    WINE_TRACE("CEG: Parsing term_event...\n");
+    strcpy(info.term_event, ipc_data);
+    ipc_data += strlen(info.term_event);
+    WINE_TRACE("CEG: term_event: %s\n", info.term_event);
+
+    WINE_TRACE("CEG: Deleting startup module...\n");
+    /* Delete the startup file given to us */
+    DeleteFileA(info.startup_module);
+
+    if (info.start_event[0] != '\0') {
+        /* Trigger the event to show that we know the game has started */
+        start_handle = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, info.start_event);
+        if (start_handle != NULL) {
+            WINE_TRACE("CEG: Triggering event.\n");
+            SetEvent(start_handle);
+            CloseHandle(start_handle);
+        }
+        else
+            WINE_TRACE("CEG: Invalid start event.\n");
+    }
+    else
+        WINE_TRACE("CEG: No start event given.\n");
+
+    WINE_TRACE("CEG: Releasing semaphore.\n");
+    ReleaseSemaphore(ceg_handles->produce_handle[0], 1, NULL);
+    ReleaseSemaphore(ceg_handles->produce_handle[1], 1, NULL);
+    WINE_TRACE("CEG: Released semaphore.\n");
+}
+
 static HANDLE run_process(void)
 {
     WCHAR *cmdline = GetCommandLineW();
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     DWORD flags = 0;
+    steam_ceg_handles ceg_handles;
 
     /* skip argv[0] */
     if (*cmdline == '"')
@@ -242,11 +356,17 @@ static HANDLE run_process(void)
 run:
     WINE_TRACE("Running command %s\n", wine_dbgstr_w(cmdline));
 
+    setup_ceg_handles(&ceg_handles);
+
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi))
     {
         WINE_ERR("Failed to create process %s: %u\n", wine_dbgstr_w(cmdline), GetLastError());
         return INVALID_HANDLE_VALUE;
     }
+
+    steam_ceg_interface(&ceg_handles);
+
+    cleanup_ceg_handles(&ceg_handles);
 
     CloseHandle(pi.hThread);
     return pi.hProcess;
